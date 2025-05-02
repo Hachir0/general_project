@@ -1,62 +1,87 @@
 import requests
+import json
+import os
+from tqdm import tqdm 
 
-url_yd = 'https://cloud-api.yandex.net/v1/disk/resources'
+DOG_API_URL = "https://dog.ceo/api/breed/"
+YANDEX_DISK_API_URL = "https://cloud-api.yandex.net/v1/disk/resources"
+YANDEX_UPLOAD_API_URL = "https://cloud-api.yandex.net/v1/disk/resources/upload"
 
-url = 'https://dog.ceo/api/breed/'
+def create_folder_on_yandex_disk(folder_name, token):
+    """Создаёт папку на Яндекс.Диске, если её нет."""
+    response = requests.put(
+        YANDEX_DISK_API_URL,
+        params={"path": folder_name},
+        headers={"Authorization": f"OAuth {token}"},
+    )
+    if response.status_code not in (201, 409):  # 409 = папка уже существует
+        raise Exception(f"Ошибка при создании папки: {response.json()}")
 
-inp = input("Введите породу собаки: ")
-
-token_YD = input("Введите токен Яндекс диска: ")
-
-def get_info_doge(inp, token):
-
-     #создаем папку с названием породы в ядекс диске
-    requests.put(url_yd, params = {"path": inp}, headers = {'Authorization': f'OAuth {token}'})
+def upload_to_yandex_disk(file_name, file_url, folder_name, token):
+    # Получаем ссылку для загрузки
+    upload_response = requests.get(
+        YANDEX_UPLOAD_API_URL,params={"path": f"{folder_name}/{file_name}","url": file_url,},
+        headers={"Authorization": f"OAuth {token}"},)
     
-    # записываем в переменную ссылку на фото переданной породы
-    res = requests.get(f'{url}{inp}/images/random')
-    data = res.json()
+    upload_url = upload_response.json().get("href")  # Ссылка для загрузки на Яндекс.Диск
+    if not upload_url:
+        raise Exception("Не удалось получить ссылку для загрузки на Яндекс.Диск")
     
-    # записываем в файл фото собаки переданной породы
-
-    with open(f'image_dogs/{inp}.jpg', 'wb') as f:
-        f.write(requests.get(data['message']).content)
-
-    #  Загружаем на Я.Диск
-    params = {"path": f'{inp}/{inp}'}
-    headers = {'Authorization': f'OAuth {token}'}
+    # Загружаем файл по полученному URL
+    file_response = requests.put(upload_url, headers={"Authorization": f"OAuth {token}"})
     
-    r = requests.get(f'{url_yd}/upload', params=params, headers=headers)
-    upload_url = r.json()['href']
+    if file_response.status_code == 201:
+        print(f"Изображение {file_name} успешно загружено на Яндекс.Диск.")
+    else:
+        raise Exception(f"Ошибка при загрузке изображения {file_name}: {file_response.status_code} - {file_response.text}")
 
-    with open(f'image_dogs/{inp}.jpg', 'rb') as f:
-        requests.put(upload_url, files={'file': f})
+def get_breed_images(breed):
+    images = []
     
-    # получаем подпороды
-    res1 = requests.get(f'{url}{inp}/list')
-    sub_breeds = res1.json()["message"]
-
-    for sub in sub_breeds:
-        # Загружаем фото подпороды
-        
-        # получаем ссылку на фото подпороды
-        img_url = requests.get(f'{url}{inp}/{sub}/images/random').json()['message']
-        
-        #получаем ссылку на загрузку фото в ядекс диске 
-        params = {"path": f'{inp}/{inp}_{sub}'}
-        headers = {'Authorization': f'OAuth {token}'}
-        
-        r = requests.get(f'{url_yd}/upload', params=params, headers=headers)
-        upload_url = r.json()['href']
-
-        with open(f'image_dogs/{inp}_{sub}.jpg', 'wb') as f:
-            f.write(requests.get(img_url).content)
-        
-        # загружаем подпороду на яндекс диск
-        with open(f'image_dogs/{inp}_{sub}.jpg', 'rb') as f:
-            requests.put(upload_url, files={'file': f})
+    # Проверяем, есть ли подпороды
+    sub_breeds_response = requests.get(f"{DOG_API_URL}{breed}/list")
+    sub_breeds = sub_breeds_response.json().get("message", [])
     
-    return f"Фото собаки данной породы загруженo(ны) на ваш Я.Диск в папке {inp}"
-        
-print(get_info_doge(inp, token_YD))
+    if sub_breeds:
+        # Если есть подпороды, загружаем их изображения
+        for sub_breed in sub_breeds:
+            sub_images_response = requests.get(f"{DOG_API_URL}{breed}/{sub_breed}/images")
+            sub_images = sub_images_response.json().get("message", [])
+            images.extend([(f"{breed}_{sub_breed}", img) for img in sub_images])
+    else:
+        # Если подпород нет, загружаем изображения основной породы
+        images_response = requests.get(f"{DOG_API_URL}{breed}/images")
+        images = [(breed, img) for img in images_response.json().get("message", [])]
+    
+    return images
 
+def backup_dog_images(breed, token):
+    # Получаем все изображения породы
+    images = get_breed_images(breed)
+    if not images:
+        print(f"Нет изображений для породы {breed}.")
+        return
+    
+    # Создаём папку на Яндекс.Диске
+    create_folder_on_yandex_disk(breed, token)
+    
+    # Загружаем каждое изображение
+    uploaded_files = []
+    for breed_name, image_url in tqdm(images, desc="Загрузка изображений"):
+        file_name = f"{breed_name}_{os.path.basename(image_url)}"
+        try:
+            upload_to_yandex_disk(file_name, image_url, breed, token)
+            uploaded_files.append({"file_name": file_name})
+        except Exception as e:
+            print(f"Ошибка при загрузке {file_name}: {e}")
+    
+    # Сохраняем информацию в JSON
+    with open(f"{breed}_backup.json", "w") as f:
+        json.dump(uploaded_files, f, indent=2)
+    
+    print(f"Готово! Загружено {len(uploaded_files)} изображений.")
+
+if __name__ == "__main__":
+    breed = input("Введите породу собаки: ")
+    token = input("Введите токен Яндекс.Диска: ")
+    backup_dog_images(breed, token)
